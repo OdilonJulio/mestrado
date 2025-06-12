@@ -34,7 +34,7 @@ prepare_pca_data <- function(transcriptogram_obj) {
 run_pca_enhanced <- function(pca_input) {
   # Remover colunas com variância zero (novo)
   variances <- apply(pca_input, 2, var)
-  pca_input_cleaned <- pca_input[, variances > 0]
+  #pca_input_cleaned <- pca_input[, variances > 0]
   
   if (ncol(pca_input_cleaned) == 0) {
     stop("Todas as colunas têm variância zero.")
