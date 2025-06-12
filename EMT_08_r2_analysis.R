@@ -1,80 +1,136 @@
-# reconstruction_metrics_R2.R
-# Implementação exata da fórmula LaTeX para cálculo do R²
+# transcriptogram_reconstruction_validation_optimized.R
+# Versão otimizada para alto desempenho
 
-# Função que calcula o R² conforme definição matemática
-calculate_transcriptogram_R2 <- function(T_matrix, T_reconstructed) {
-  # Verificação de dimensões
-  if (!identical(dim(T_matrix), dim(T_reconstructed))) {
-    stop("As matrizes devem ter dimensões idênticas")
-  }
-  
-  # Número de células e genes (notação igual ao LaTeX)
-  N_células <- nrow(T_matrix)
-  N_genes <- ncol(T_matrix)
-  
-  # Cálculo de T_med,i (média por gene - Eq. 2 do LaTeX)
-  T_med_i <- colMeans(T_matrix)
-  
-  # Proteção contra divisão por zero (limiar 1e-10)
-  T_med_i_sq <- ifelse(T_med_i^2 == 0, 1e-10, T_med_i^2)
-  
-  # Cálculo do erro quadrático normalizado (Eq. 1 do LaTeX)
-  squared_error <- (T_matrix - T_reconstructed)^2
-  normalized_error <- sweep(squared_error, 2, T_med_i_sq, "/")
-  
-  # Cálculo final do R²
-  R2 <- sum(normalized_error) / (N_células * N_genes)
-  
-  return(R2)
-}
+library(transcriptogramer)
+library(dplyr)
+library(ggplot2)
+library(doParallel)
+library(foreach)
+library(Matrix)
 
-# -------------------------------------------------------------------------
-# Adaptação para seu pipeline específico (com seus nomes de objetos)
-# -------------------------------------------------------------------------
+# 1. Configurar paralelização
+registerDoParallel(cores = detectCores() - 2)
 
-# 1. Preparação dos dados (igual ao seu script anterior)
+# 2. Carregar dados necessários
+load("reconstructed_matrix_R0.RData")
+load("reconstructed_matrix_R30.RData")
 load("t_matrix_R0.RData")
 load("t_matrix_R30.RData")
-load("reconstructed_transcriptograms_final.RData")
+load("pca_result_R0.RData")
+load("pca_result_R30.RData")
 
-# 2. Preparar matrizes (funções do seu script)
+# 3. Funções otimizadas
 prepare_original_matrix <- function(transcriptogram_obj) {
-  df <- as.data.frame(transcriptogram_obj@transcriptogramS2)
-  mat <- as.matrix(df[, -c(1, 2)])  # Remove colunas não-numéricas
-  t_mat <- t(mat)
-  colnames(t_mat) <- df$Protein
-  return(t_mat)
+  df <- transcriptogram_obj@transcriptogramS2
+  rownames(df) <- df$Protein
+  df <- df[, !colnames(df) %in% c("Protein", "Position")]
+  t(as.matrix(df))
 }
 
-prepare_reconstructed_matrix <- function(reconstructed_matrix, original_cell_names) {
-  t_reconstructed <- t(reconstructed_matrix)
-  rownames(t_reconstructed) <- original_cell_names
-  return(t_reconstructed)
+calculate_r_squared <- function(original, reconstructed) {
+  gene_means <- rowMeans(original, na.rm = TRUE)
+  mode_value <- median(original) / 1000
+  zero_means <- gene_means == 0
+  gene_means[zero_means] <- mode_value
+  
+  squared_diff <- (original - reconstructed)^2
+  normalized_diff <- squared_diff / (gene_means^2)
+  
+  list(
+    global = mean(normalized_diff, na.rm = TRUE),
+    by_gene = rowMeans(normalized_diff, na.rm = TRUE),
+    by_cell = colMeans(normalized_diff, na.rm = TRUE),
+    adjusted_zero_genes = sum(zero_means),
+    adjustment_value = mode_value
+  )
 }
 
-# 3. Aplicação às suas matrizes específicas
-T_matrix_R0 <- prepare_original_matrix(t_matrix_R0)
-T_reconstructed_R0 <- prepare_reconstructed_matrix(reconstructed_r0, rownames(T_matrix_R0))
+reconstruct_with_n_pcs <- function(pca_result, original_matrix, n_pcs) {
+  rotation <- pca_result$pca_result$rotation[, 1:n_pcs, drop = FALSE]
+  components <- pca_result$pca_result$x[, 1:n_pcs, drop = FALSE]
+  center <- pca_result$pca_result$center
+  
+  reconstructed <- components %*% t(rotation)
+  
+  if (!is.null(center)) {
+    reconstructed <- reconstructed + rep(center, each = nrow(components))
+  }
+  
+  t(reconstructed)
+}
 
-T_matrix_R30 <- prepare_original_matrix(t_matrix_R30)
-T_reconstructed_R30 <- prepare_reconstructed_matrix(reconstructed_r30, rownames(T_matrix_R30))
+analyze_pc_components <- function(pca_result, original_matrix, radius_label) {
+  max_pcs <- ncol(pca_result$pca_result$x)
+  
+  results <- foreach(n = 1:max_pcs, .combine = rbind) %dopar% {
+    reconstructed <- reconstruct_with_n_pcs(pca_result, original_matrix, n)
+    r2 <- calculate_r_squared(original_matrix, reconstructed)
+    data.frame(n_pcs = n, r_squared = r2$global)
+  }
+  
+  results <- results[order(results$n_pcs), ]
+  
+  plot <- ggplot(results, aes(x = n_pcs, y = r_squared)) +
+    geom_line(color = "steelblue") +
+    geom_point(color = "steelblue") +
+    labs(title = paste("Erro de reconstrução por número de PCs -", radius_label),
+         x = "Número de Componentes Principais",
+         y = "Erro R²",
+         caption = paste("Análise para", radius_label)) +
+    theme_minimal()
+  
+  list(results = results, plot = plot)
+}
 
-# 4. Cálculo do R² (fiel ao LaTeX)
-R2_R0 <- calculate_transcriptogram_R2(T_matrix_R0, T_reconstructed_R0)
-R2_R30 <- calculate_transcriptogram_R2(T_matrix_R30, T_reconstructed_R30)
+# 4. Preparar matrizes originais (convertidas para formato esparso)
+original_matrix_R0 <- as(prepare_original_matrix(t_matrix_R0), "dgCMatrix")
+original_matrix_R30 <- as(prepare_original_matrix(t_matrix_R30), "dgCMatrix")
 
-# 5. Saída formatada
-cat("-------------------------------------\n")
-cat("Resultados do R² (definição LaTeX):\n")
-cat("-------------------------------------\n")
-cat(sprintf("Raio 0:  R² = %.6f\n", R2_R0))
-cat(sprintf("Raio 30: R² = %.6f\n", R2_R30))
-cat("-------------------------------------\n")
-cat("Nota: Valores mais próximos de 0 indicam melhor reconstrução.\n")
+# 5. Executar análises em paralelo
+analysis_results <- foreach(r = list(list(pca_result_R0, original_matrix_R0, "R0"),
+                           list(pca_result_R30, original_matrix_R30, "R30")),
+                          .combine = list) %dopar% {
+  analyze_pc_components(r[[1]], r[[2]], r[[3]])
+}
 
-# 6. Salvar resultados (opcional)
-metrics <- list(
-  R0 = list(R2 = R2_R0),
-  R30 = list(R2 = R2_R30)
-)
-save(metrics, file = "R2_metrics_LaTeX_definition.RData")
+analysis_R0 <- analysis_results[[1]]
+analysis_R30 <- analysis_results[[2]]
+
+# 6. Cálculo final otimizado
+calculate_full_recon <- function(original, reconstructed) {
+  chunk_size <- 1000
+  n_genes <- nrow(original)
+  chunks <- split(1:n_genes, ceiling(seq_along(1:n_genes)/chunk_size))
+  
+  results <- foreach(chunk = chunks, .combine = c) %dopar% {
+    calculate_r_squared(original[chunk, ], reconstructed[chunk, ])$global
+  }
+  
+  list(global = mean(results))
+}
+
+full_recon_r2_R0 <- calculate_full_recon(original_matrix_R0, reconstructed_matrix_R0)
+full_recon_r2_R30 <- calculate_full_recon(original_matrix_R30, reconstructed_matrix_R30)
+
+# 7. Resultados e gráficos (mesmo código original)
+cat("=== Resultados para R0 ===\n")
+cat("Erro R² global (todos PCs):", full_recon_r2_R0$global, "\n")
+print(head(analysis_R0$results))
+
+cat("\n=== Resultados para R30 ===\n")
+cat("Erro R² global (todos PCs):", full_recon_r2_R30$global, "\n")
+print(head(analysis_R30$results))
+
+print(analysis_R0$plot)
+print(analysis_R30$plot)
+
+# 8. Salvar resultados
+save(analysis_R0, analysis_R30, full_recon_r2_R0, full_recon_r2_R30,
+     file = "transcriptogram_reconstruction_validation.RData")
+
+ggsave("reconstruction_error_R0.png", analysis_R0$plot, width = 8, height = 6)
+ggsave("reconstruction_error_R30.png", analysis_R30$plot, width = 8, height = 6)
+
+# 9. Limpar memória
+rm(list = ls()[!ls() %in% c("analysis_R0", "analysis_R30", "full_recon_r2_R0", "full_recon_r2_R30")])
+gc(full = TRUE)
